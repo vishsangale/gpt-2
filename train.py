@@ -23,6 +23,7 @@ import torch
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
+from torch.utils.tensorboard import SummaryWriter
 
 from model import GPT2
 
@@ -41,8 +42,9 @@ class SystemConfig:
 @dataclass
 class DatasetConfig:
     dataset: str = 'tinyshakespeare'
-    gradient_accumulation_steps: int = 40 # 5 * 8
-    batch_size: int = 12
+    num_workers: int = 4
+    gradient_accumulation_steps: int = 30 # 16 * 30 = 480
+    batch_size: int = 16
     block_size: int = 1024
     eval_interval: int = 2000
     log_interval: int = 1
@@ -78,30 +80,86 @@ class ModelConfig:
 # Helper Functions
 # -----------------------------------------------------------------------------
 
-def get_batch(split, train_data, val_data, dataset_config, system_config, device):
-    data = train_data if split == 'train' else val_data
-    ix = torch.randint(len(data) - dataset_config.block_size, (dataset_config.batch_size,))
-    x = torch.stack([torch.from_numpy((data[i:i+dataset_config.block_size]).astype(np.int64)) for i in ix])
-    y = torch.stack([torch.from_numpy((data[i+1:i+1+dataset_config.block_size]).astype(np.int64)) for i in ix])
+def get_latest_checkpoint(out_dir):
+    """Finds the latest checkpoint file in out_dir."""
+    if not os.path.exists(out_dir):
+        return None
     
-    device_type = 'cuda' if 'cuda' in system_config.device else 'cpu'
-    if device_type == 'cuda':
-        # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
-        x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
-    else:
-        x, y = x.to(device), y.to(device)
-    return x, y
+    # Check for specific files
+    ckpt_path = os.path.join(out_dir, 'ckpt.pt')
+    if os.path.exists(ckpt_path):
+        return ckpt_path
+
+    # Check for versioned files ckpt_{iter}.pt
+    files = [f for f in os.listdir(out_dir) if f.startswith('ckpt_') and f.endswith('.pt')]
+    if not files:
+        return None
+    
+    # Extract version numbers
+    def extract_iter(f):
+        try:
+            return int(f.split('_')[1].split('.')[0])
+        except (IndexError, ValueError):
+            return -1
+            
+    files = sorted(files, key=extract_iter, reverse=True)
+    if files:
+        return os.path.join(out_dir, files[0])
+    
+    return None
+
+class GPT2Dataset(torch.utils.data.Dataset):
+    def __init__(self, data, block_size):
+        self.data = data
+        self.block_size = block_size
+        
+    def __len__(self):
+        return len(self.data) - self.block_size
+        
+    def __getitem__(self, idx):
+        # We need to ensure we don't go out of bounds, though __len__ helps.
+        # Ideally we'd just pick random indices like before for infinite stream, 
+        # but Dataset usually maps index -> item.
+        # To strictly replicate the previous "infinite random sampling" behavior without epochs:
+        # We can make the dataset "infinite" or just very large, OR we can stick to the 
+        # random sampling logic inside __getitem__ if we ignore idx, but that defeats the purpose of map-style.
+        # Better approach for map-style:
+        # Just return the slice at idx. The DataLoader with shuffle=True will handle randomness.
+        # Note: Previous code did random sampling from *anywhere*. 
+        # Configuring an IterableDataset is arguably better for "infinite" streaming, 
+        # but Map-style with Shuffle is standard and easiest to implement for now.
+        
+        # However, for 'infinite' training loop style we used before, a standard epoch-based loader 
+        # might require changing the loop structure (while loader: ...).
+        # Let's keep the existing loop structure and make the loader infinite-cyclic or just re-create it.
+        # Actually, standard practice for LLM pretraining is often IterableDataset.
+        # But let's stick to simple Map-style with a large length or just wrapping it.
+        
+        # IMPORTANT: efficient slicing of memmap is fine.
+        x = torch.from_numpy((self.data[idx:idx+self.block_size]).astype(np.int64))
+        y = torch.from_numpy((self.data[idx+1:idx+1+self.block_size]).astype(np.int64))
+        return x, y
 
 @torch.no_grad()
 def estimate_loss(model, ctx, train_data, val_data, dataset_config, system_config, device, eval_iters):
     out = {}
     model.eval()
-    for split in ['train', 'val']:
+    for split, data in [('train', train_data), ('val', val_data)]:
         losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
-            X, Y = get_batch(split, train_data, val_data, dataset_config, system_config, device)
+            # manual random sampling for estimation
+            ix = torch.randint(len(data) - dataset_config.block_size, (dataset_config.batch_size,))
+            x = torch.stack([torch.from_numpy((data[i:i+dataset_config.block_size]).astype(np.int64)) for i in ix])
+            y = torch.stack([torch.from_numpy((data[i+1:i+1+dataset_config.block_size]).astype(np.int64)) for i in ix])
+            
+            device_type = 'cuda' if 'cuda' in system_config.device else 'cpu'
+            if device_type == 'cuda':
+                x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
+            else:
+                x, y = x.to(device), y.to(device)
+            
             with ctx:
-                logits, loss = model(X, Y)
+                logits, loss = model(x, y)
             losses[k] = loss.item()
         out[split] = losses.mean()
     model.train()
@@ -195,6 +253,7 @@ def main():
     if master_process:
         print(f"tokens per iteration will be: {tokens_per_iter:,}")
         os.makedirs(system_cfg.out_dir, exist_ok=True)
+        writer = SummaryWriter(log_dir=system_cfg.out_dir)
 
     torch.manual_seed(1337 + seed_offset)
     torch.backends.cuda.matmul.allow_tf32 = True 
@@ -209,6 +268,18 @@ def main():
     train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
     val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
 
+    train_dataset = GPT2Dataset(train_data, dataset_cfg.block_size)
+    train_loader = torch.utils.data.DataLoader(
+        train_dataset, 
+        batch_size=dataset_cfg.batch_size, 
+        shuffle=True, 
+        num_workers=dataset_cfg.num_workers, 
+        pin_memory=True,
+        drop_last=True
+    )
+    # create an infinite iterator
+    train_iter = iter(train_loader)
+
     # Model Init
     iter_num = 0
     best_val_loss = 1e9
@@ -219,23 +290,35 @@ def main():
         model = GPT2(model_cfg)
     elif dataset_cfg.init_from == 'resume':
         print(f"Resuming training from {system_cfg.out_dir}")
-        ckpt_path = os.path.join(system_cfg.out_dir, 'ckpt.pt')
-        checkpoint = torch.load(ckpt_path, map_location=device)
-        # load model args from checkpoint
-        checkpoint_model_args = checkpoint['model_args']
-        for k, v in checkpoint_model_args.__dict__.items():
-            if hasattr(model_cfg, k):
-                setattr(model_cfg, k, v)
-        
-        model = GPT2(model_cfg)
-        state_dict = checkpoint['model']
-        unwanted_prefix = '_orig_mod.'
-        for k,v in list(state_dict.items()):
-            if k.startswith(unwanted_prefix):
-                state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
-        model.load_state_dict(state_dict)
-        iter_num = checkpoint['iter_num']
-        best_val_loss = checkpoint['best_val_loss']
+        ckpt_path = get_latest_checkpoint(system_cfg.out_dir)
+        if ckpt_path is None:
+            print(f"No checkpoint found in {system_cfg.out_dir}, starting from scratch")
+            dataset_cfg.init_from = 'scratch'
+            model = GPT2(model_cfg)
+        else:
+            print(f"Loading checkpoint from {ckpt_path}")
+            checkpoint = torch.load(ckpt_path, map_location=device)
+            # load model args from checkpoint
+            checkpoint_model_args = checkpoint['model_args']
+            # handle both dict and object (legacy compatibility)
+            if isinstance(checkpoint_model_args, dict):
+                for k, v in checkpoint_model_args.items():
+                    if hasattr(model_cfg, k):
+                        setattr(model_cfg, k, v)
+            else:
+                 for k, v in checkpoint_model_args.__dict__.items():
+                    if hasattr(model_cfg, k):
+                        setattr(model_cfg, k, v)
+            
+            model = GPT2(model_cfg)
+            state_dict = checkpoint['model']
+            unwanted_prefix = '_orig_mod.'
+            for k,v in list(state_dict.items()):
+                if k.startswith(unwanted_prefix):
+                    state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
+            model.load_state_dict(state_dict)
+            iter_num = checkpoint['iter_num']
+            best_val_loss = checkpoint['best_val_loss']
     elif dataset_cfg.init_from.startswith('gpt2'):
         print(f"Initializing from OpenAI GPT-2 weights: {dataset_cfg.init_from}")
         override_args = dict(dropout=model_cfg.dropout)
@@ -252,8 +335,8 @@ def main():
     model.to(device)
 
     # Optimizer
-    optimizer = torch.optim.AdamW(model.parameters(), lr=train_cfg.learning_rate, betas=(train_cfg.beta1, train_cfg.beta2), weight_decay=train_cfg.weight_decay)
-    if dataset_cfg.init_from == 'resume':
+    optimizer = torch.optim.AdamW(model.parameters(), lr=train_cfg.learning_rate, betas=(train_cfg.beta1, train_cfg.beta2), weight_decay=train_cfg.weight_decay, fused=True)
+    if dataset_cfg.init_from == 'resume' and 'optimizer' in checkpoint:
         optimizer.load_state_dict(checkpoint['optimizer'])
     checkpoint = None
 
@@ -269,7 +352,6 @@ def main():
     raw_model = model.module if ddp else model
 
     # Training Loop
-    X, Y = get_batch('train', train_data, val_data, dataset_cfg, system_cfg, device)
     t0 = time.time()
     
     while True:
@@ -282,6 +364,11 @@ def main():
         if iter_num % dataset_cfg.eval_interval == 0 and master_process:
             losses = estimate_loss(model, ctx, train_data, val_data, dataset_cfg, system_config=system_cfg, device=device, eval_iters=dataset_cfg.eval_iters)
             print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+            if master_process:
+                writer.add_scalar("loss/train", losses['train'], iter_num)
+                writer.add_scalar("loss/val", losses['val'], iter_num)
+                writer.add_scalar("lr", lr, iter_num)
+            
             if losses['val'] < best_val_loss or dataset_cfg.always_save_checkpoint:
                 best_val_loss = losses['val']
                 if iter_num > 0:
@@ -293,7 +380,9 @@ def main():
                         'best_val_loss': best_val_loss
                     }
                     print(f"saving checkpoint to {system_cfg.out_dir}")
-                    torch.save(checkpoint, os.path.join(system_cfg.out_dir, 'ckpt.pt'))
+                    # save versioned checkpoint
+                    ckpt_name = f'ckpt_{iter_num}.pt'
+                    torch.save(checkpoint, os.path.join(system_cfg.out_dir, ckpt_name))
         
         if iter_num == 0 and dataset_cfg.eval_only:
             break
@@ -302,10 +391,19 @@ def main():
         for micro_step in range(dataset_cfg.gradient_accumulation_steps):
             if ddp:
                 model.require_backward_grad_sync = (micro_step == dataset_cfg.gradient_accumulation_steps - 1)
+            
+            # fetch next batch
+            try:
+                X, Y = next(train_iter)
+            except StopIteration:
+                train_iter = iter(train_loader)
+                X, Y = next(train_iter)
+                
+            X, Y = X.to(device, non_blocking=True), Y.to(device, non_blocking=True)
+
             with ctx:
                 logits, loss = model(X, Y)
                 loss = loss / dataset_cfg.gradient_accumulation_steps
-            X, Y = get_batch('train', train_data, val_data, dataset_cfg, system_cfg, device)
             loss.backward()
             
         if train_cfg.grad_clip != 0.0:
@@ -320,11 +418,22 @@ def main():
         t0 = t1
         if iter_num % dataset_cfg.log_interval == 0 and master_process:
             lossf = loss.item() * dataset_cfg.gradient_accumulation_steps
-            print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms")
+            if dt > 0:
+                 mfu = -1.0 # placeholder
+                 tokens_per_sec = (dataset_cfg.gradient_accumulation_steps * dataset_cfg.batch_size * dataset_cfg.block_size) / dt
+                 print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, tok/sec {tokens_per_sec:.2f}")
+                 writer.add_scalar("loss/step", lossf, iter_num)
+                 writer.add_scalar("perf/tokens_per_sec", tokens_per_sec, iter_num)
+            else:
+                 print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms")
+                 writer.add_scalar("loss/step", lossf, iter_num)
             
         iter_num += 1
         if iter_num > train_cfg.max_iters:
             break
+            
+    if master_process:
+        writer.close()
             
     if ddp:
         destroy_process_group()

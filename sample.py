@@ -23,6 +23,37 @@ compile = False # use PyTorch 2.0 to compile the model to be faster
 exec(open('configurator.py').read()) if os.path.exists('configurator.py') else None # overrides from command line or config file
 # -----------------------------------------------------------------------------
 
+# -----------------------------------------------------------------------------
+# Helper Functions
+# -----------------------------------------------------------------------------
+def get_latest_checkpoint(out_dir):
+    """Finds the latest checkpoint file in out_dir."""
+    if not os.path.exists(out_dir):
+        return None
+    
+    # Check for specific files
+    ckpt_path = os.path.join(out_dir, 'ckpt.pt')
+    if os.path.exists(ckpt_path):
+        return ckpt_path
+
+    # Check for versioned files ckpt_{iter}.pt
+    files = [f for f in os.listdir(out_dir) if f.startswith('ckpt_') and f.endswith('.pt')]
+    if not files:
+        return None
+    
+    # Extract version numbers
+    def extract_iter(f):
+        try:
+            return int(f.split('_')[1].split('.')[0])
+        except (IndexError, ValueError):
+            return -1
+            
+    files = sorted(files, key=extract_iter, reverse=True)
+    if files:
+        return os.path.join(out_dir, files[0])
+    
+    return None
+
 torch.manual_seed(seed)
 torch.cuda.manual_seed(seed)
 torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
@@ -34,7 +65,12 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 # model
 if init_from == 'resume':
     # init from a model saved in a specific directory
-    ckpt_path = os.path.join(out_dir, 'ckpt.pt')
+    ckpt_path = get_latest_checkpoint(out_dir)
+    if ckpt_path is None:
+        print(f"No checkpoint found in {out_dir}, cannot resume.")
+        exit(1)
+    
+    print(f"Loading checkpoint from {ckpt_path}")
     checkpoint = torch.load(ckpt_path, map_location=device)
     gptconf = checkpoint['model_args']
     # create the model
@@ -42,7 +78,13 @@ if init_from == 'resume':
         def __init__(self, **kwargs):
             for k,v in kwargs.items():
                 setattr(self, k, v)
-    conf = SimpleConfig(**gptconf)
+    
+    # handle dict vs object
+    if isinstance(gptconf, dict):
+         conf = SimpleConfig(**gptconf)
+    else:
+         conf = SimpleConfig(**gptconf.__dict__)
+         
     model = GPT2(conf)
     state_dict = checkpoint['model']
     unwanted_prefix = '_orig_mod.'
