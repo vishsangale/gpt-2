@@ -2,6 +2,7 @@ import math
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+import torch.utils.checkpoint
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, config):
@@ -114,7 +115,10 @@ class GPT2(nn.Module):
         x = self.transformer.drop(tok_emb + pos_emb)
         
         for block in self.transformer.h:
-            x = block(x)
+            if self.config.gradient_checkpointing:
+                x = torch.utils.checkpoint.checkpoint(block, x, use_reentrant=False)
+            else:
+                x = block(x)
         x = self.transformer.ln_f(x)
 
         if targets is not None:

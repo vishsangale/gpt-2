@@ -51,7 +51,8 @@ class DatasetConfig:
     eval_iters: int = 200
     eval_only: bool = False
     always_save_checkpoint: bool = True
-    init_from: str = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
+    checkpoint_interval: int = 100
+    init_from: str = 'resume' # 'scratch' or 'resume' or 'gpt2*'
 
 @dataclass
 class TrainConfig:
@@ -75,6 +76,7 @@ class ModelConfig:
     bias: bool = False
     vocab_size: int = 50304 # default, will be adjusted
     block_size: int = 1024
+    gradient_checkpointing: bool = True # Trade compute to save memory
 
 # -----------------------------------------------------------------------------
 # Helper Functions
@@ -297,7 +299,7 @@ def main():
             model = GPT2(model_cfg)
         else:
             print(f"Loading checkpoint from {ckpt_path}")
-            checkpoint = torch.load(ckpt_path, map_location=device)
+            checkpoint = torch.load(ckpt_path, map_location='cpu')
             # load model args from checkpoint
             checkpoint_model_args = checkpoint['model_args']
             # handle both dict and object (legacy compatibility)
@@ -336,14 +338,35 @@ def main():
 
     # Optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=train_cfg.learning_rate, betas=(train_cfg.beta1, train_cfg.beta2), weight_decay=train_cfg.weight_decay, fused=True)
+    # extract optimizer state but don't load yet (to save memory during compile)
+    optimizer_state = None
     if dataset_cfg.init_from == 'resume' and 'optimizer' in checkpoint:
-        optimizer.load_state_dict(checkpoint['optimizer'])
+        optimizer_state = checkpoint['optimizer']
     checkpoint = None
+    torch.cuda.empty_cache() # free up memory from the checkpoint load
 
     # Compile
     if system_cfg.compile:
         print("compiling the model... (takes a ~minute)")
         model = torch.compile(model)
+        
+        # Warmup compilation with a dummy step
+        # This forces the compilation to happen NOW, before we load the optimizer state
+        # preventing the memory spike of (Model + Optimizer + Compile Overhead)
+        print("running warmup step for compilation...")
+        dummy_x = torch.randint(0, 50257, (dataset_cfg.batch_size, dataset_cfg.block_size), device=device)
+        dummy_y = torch.randint(0, 50257, (dataset_cfg.batch_size, dataset_cfg.block_size), device=device)
+        with ctx:
+            _, loss = model(dummy_x, dummy_y)
+            loss.backward()
+        optimizer.zero_grad(set_to_none=True)
+        torch.cuda.empty_cache()
+
+    # Restore optimizer state
+    if optimizer_state is not None:
+        print("loading optimizer state...")
+        optimizer.load_state_dict(optimizer_state)
+        optimizer_state = None
 
     # Wrap DDP
     if ddp:
@@ -369,20 +392,28 @@ def main():
                 writer.add_scalar("loss/val", losses['val'], iter_num)
                 writer.add_scalar("lr", lr, iter_num)
             
-            if losses['val'] < best_val_loss or dataset_cfg.always_save_checkpoint:
+            if losses['val'] < best_val_loss:
                 best_val_loss = losses['val']
-                if iter_num > 0:
-                    checkpoint = {
-                        'model': raw_model.state_dict(),
-                        'optimizer': optimizer.state_dict(),
-                        'model_args': asdict(model_cfg),
-                        'iter_num': iter_num,
-                        'best_val_loss': best_val_loss
-                    }
-                    print(f"saving checkpoint to {system_cfg.out_dir}")
-                    # save versioned checkpoint
-                    ckpt_name = f'ckpt_{iter_num}.pt'
-                    torch.save(checkpoint, os.path.join(system_cfg.out_dir, ckpt_name))
+        
+        if iter_num > 0 and iter_num % dataset_cfg.checkpoint_interval == 0 and master_process:
+            checkpoint = {
+                'model': raw_model.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'model_args': asdict(model_cfg),
+                'iter_num': iter_num,
+                'best_val_loss': best_val_loss
+            }
+            print(f"saving checkpoint to {system_cfg.out_dir}")
+            # save versioned checkpoint
+            ckpt_name = f'ckpt_{iter_num}.pt'
+            torch.save(checkpoint, os.path.join(system_cfg.out_dir, ckpt_name))
+
+            # only keep last 5 checkpoints
+            checkpoints = sorted([f for f in os.listdir(system_cfg.out_dir) if f.startswith('ckpt_') and f.endswith('.pt')],
+                                key=lambda x: int(x.split('_')[1].split('.')[0]))
+            while len(checkpoints) > 5:
+                to_remove = checkpoints.pop(0) # remove oldest
+                os.remove(os.path.join(system_cfg.out_dir, to_remove))
         
         if iter_num == 0 and dataset_cfg.eval_only:
             break
