@@ -77,6 +77,10 @@ class ModelConfig:
     vocab_size: int = 50304 # default, will be adjusted
     block_size: int = 1024
     gradient_checkpointing: bool = True # Trade compute to save memory
+    # Modernization flags
+    use_rmsnorm: bool = False
+    use_rope: bool = False
+    use_swiglu: bool = False
 
 # -----------------------------------------------------------------------------
 # Helper Functions
@@ -266,7 +270,7 @@ def main():
     ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
     # Data Loader
-    data_dir = os.path.dirname(__file__)
+    data_dir = os.path.join('data', dataset_cfg.dataset)
     train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
     val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
 

@@ -4,6 +4,62 @@ import torch.nn as nn
 from torch.nn import functional as F
 import torch.utils.checkpoint
 
+# -----------------------------------------------------------------------------
+# Modernization Modules
+# -----------------------------------------------------------------------------
+
+class RMSNorm(nn.Module):
+    def __init__(self, dim, eps=1e-5):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.eps = eps
+
+    def forward(self, x):
+        output = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        return output * self.weight
+
+class SwiGLU(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.w1 = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
+        self.w2 = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
+        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
+        self.dropout = nn.Dropout(config.dropout)
+        
+    def forward(self, x):
+        x1 = self.w1(x)
+        x2 = self.w2(x)
+        hidden = F.silu(x1) * x2
+        return self.dropout(self.c_proj(hidden))
+
+def precompute_freqs_cis(dim, end, theta=10000.0):
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
+    t = torch.arange(end, device=freqs.device)
+    freqs = torch.outer(t, freqs).float()
+    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
+    return freqs_cis
+
+def apply_rotary_emb(xq, xk, freqs_cis):
+    xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
+    xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
+    freqs_cis = freqs_cis[:xq_.shape[2]] # match sequence length
+    # broadcast to batch and num_heads
+    # xq matches (B, T, n_head, head_dim/2 complex) or (B, n_head, T, ...)
+    # Our Q is (B, n_head, T, head_dim)
+    # let's assume we reshape to (B, n_head, T, head_dim/2, 2) -> complex
+    
+    # Actually, current implementation of CausalSelfAttention transposes to (B, nh, T, hs)
+    # We apply rope on the 'T' dimension.
+    # Dimensions: xq_: (B, nh, T, hs/2)
+    # freqs_cis: (T, hs/2) -> broadcast to (1, 1, T, hs/2)
+    freqs_cis = freqs_cis.view(1, 1, freqs_cis.shape[0], freqs_cis.shape[1])
+    
+    xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
+    xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
+    return xq_out.type_as(xq), xk_out.type_as(xk)
+
+# -----------------------------------------------------------------------------
+
 class CausalSelfAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -22,7 +78,9 @@ class CausalSelfAttention(nn.Module):
         self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                      .view(1, 1, config.block_size, config.block_size))
 
-    def forward(self, x):
+
+    
+    def forward(self, x, freqs_cis=None):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
@@ -31,8 +89,9 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
-        # distinct from GPT-2, normally we mask with -inf, but for "causal" attention we can just
-        # use the causal mask.
+        if getattr(self, 'use_rope', False) and freqs_cis is not None:
+             q, k = apply_rotary_emb(q, k, freqs_cis)
+
         # flash attention
         y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
         
@@ -44,12 +103,17 @@ class CausalSelfAttention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd)
-        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd)
-        self.dropout = nn.Dropout(config.dropout)
-        self.gelu = nn.GELU()
+        if getattr(config, 'use_swiglu', False):
+            self.swiglu = SwiGLU(config)
+        else:
+            self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd)
+            self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd)
+            self.dropout = nn.Dropout(config.dropout)
+            self.gelu = nn.GELU()
 
     def forward(self, x):
+        if hasattr(self, 'swiglu'):
+            return self.swiglu(x)
         x = self.c_fc(x)
         x = self.gelu(x)
         x = self.c_proj(x)
@@ -59,13 +123,23 @@ class MLP(nn.Module):
 class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.ln_1 = nn.LayerNorm(config.n_embd)
+        if getattr(config, 'use_rmsnorm', False):
+            self.ln_1 = RMSNorm(config.n_embd)
+        else:
+            self.ln_1 = nn.LayerNorm(config.n_embd)
+            
         self.attn = CausalSelfAttention(config)
-        self.ln_2 = nn.LayerNorm(config.n_embd)
+        self.attn.use_rope = getattr(config, 'use_rope', False)
+
+        if getattr(config, 'use_rmsnorm', False):
+            self.ln_2 = RMSNorm(config.n_embd)
+        else:
+            self.ln_2 = nn.LayerNorm(config.n_embd)
+        
         self.mlp = MLP(config)
 
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
+    def forward(self, x, freqs_cis=None):
+        x = x + self.attn(self.ln_1(x), freqs_cis=freqs_cis)
         x = x + self.mlp(self.ln_2(x))
         return x
 
@@ -74,13 +148,27 @@ class GPT2(nn.Module):
         super().__init__()
         self.config = config
 
-        self.transformer = nn.ModuleDict(dict(
-            wte = nn.Embedding(config.vocab_size, config.n_embd),
-            wpe = nn.Embedding(config.block_size, config.n_embd),
-            drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-            ln_f = nn.LayerNorm(config.n_embd),
-        ))
+        if getattr(config, 'use_rope', False):
+            self.transformer = nn.ModuleDict(dict(
+                wte = nn.Embedding(config.vocab_size, config.n_embd),
+                drop = nn.Dropout(config.dropout),
+                h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+                ln_f = RMSNorm(config.n_embd) if getattr(config, 'use_rmsnorm', False) else nn.LayerNorm(config.n_embd),
+            ))
+            # No wpe for RoPE typically
+            
+            # Precompute freqs_cis
+            head_dim = config.n_embd // config.n_head
+            self.freqs_cis = precompute_freqs_cis(head_dim, config.block_size * 2) # *2 just in case
+        else:
+            self.transformer = nn.ModuleDict(dict(
+                wte = nn.Embedding(config.vocab_size, config.n_embd),
+                wpe = nn.Embedding(config.block_size, config.n_embd),
+                drop = nn.Dropout(config.dropout),
+                h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+                ln_f = RMSNorm(config.n_embd) if getattr(config, 'use_rmsnorm', False) else nn.LayerNorm(config.n_embd),
+            ))
+
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
         # with weight tying when using torch.compile() some warnings get generated:
@@ -107,18 +195,32 @@ class GPT2(nn.Module):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
-
+        
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
-        x = self.transformer.drop(tok_emb + pos_emb)
         
+        if getattr(self.config, 'use_rope', False):
+            # No wpe
+            x = self.transformer.drop(tok_emb)
+            freqs_cis = self.freqs_cis[:t].to(device)
+        else:
+            pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
+            pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
+            x = self.transformer.drop(tok_emb + pos_emb)
+            freqs_cis = None
+
         for block in self.transformer.h:
             if self.config.gradient_checkpointing:
-                x = torch.utils.checkpoint.checkpoint(block, x, use_reentrant=False)
+                # When passing extra args to checkpoint, they are passed to the module
+                if getattr(self.config, 'use_rope', False):
+                     x = torch.utils.checkpoint.checkpoint(block, x, freqs_cis, use_reentrant=False)
+                else:
+                     x = torch.utils.checkpoint.checkpoint(block, x, use_reentrant=False)
             else:
-                x = block(x)
+                 if getattr(self.config, 'use_rope', False):
+                     x = block(x, freqs_cis)
+                 else:
+                     x = block(x)
         x = self.transformer.ln_f(x)
 
         if targets is not None:
