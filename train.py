@@ -11,230 +11,26 @@ $ torchrun --standalone --nproc_per_node=4 train.py
 
 import os
 import time
-import math
-import pickle
-import sys
 from contextlib import nullcontext
-from dataclasses import dataclass, asdict, field
-from ast import literal_eval
+from dataclasses import asdict
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 from torch.utils.tensorboard import SummaryWriter
 
 from model import GPT2
-
-# -----------------------------------------------------------------------------
-# Configuration Classes
-# -----------------------------------------------------------------------------
-
-@dataclass
-class SystemConfig:
-    device: str = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
-    dtype: str = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16'
-    compile: bool = True # use PyTorch 2.0 to compile the model to be faster
-    backend: str = 'nccl' # 'nccl', 'gloo', etc.
-    out_dir: str = 'out'
-
-@dataclass
-class DatasetConfig:
-    dataset: str = 'tinyshakespeare'
-    num_workers: int = 4
-    gradient_accumulation_steps: int = 30 # 16 * 30 = 480
-    batch_size: int = 16
-    block_size: int = 1024
-    eval_interval: int = 2000
-    log_interval: int = 1
-    eval_iters: int = 200
-    eval_only: bool = False
-    always_save_checkpoint: bool = True
-    checkpoint_interval: int = 100
-    init_from: str = 'resume' # 'scratch' or 'resume' or 'gpt2*'
-
-@dataclass
-class TrainConfig:
-    learning_rate: float = 6e-4
-    max_iters: int = 600000
-    weight_decay: float = 1e-1
-    beta1: float = 0.9
-    beta2: float = 0.95
-    grad_clip: float = 1.0
-    decay_lr: bool = True
-    warmup_iters: int = 2000
-    lr_decay_iters: int = 600000
-    min_lr: float = 6e-5
-
-@dataclass
-class ModelConfig:
-    n_layer: int = 12
-    n_head: int = 12
-    n_embd: int = 768
-    dropout: float = 0.0
-    bias: bool = False
-    vocab_size: int = 50304 # default, will be adjusted
-    block_size: int = 1024
-    gradient_checkpointing: bool = True # Trade compute to save memory
-    # Modernization flags
-    use_rmsnorm: bool = False
-    use_rope: bool = False
-    use_swiglu: bool = False
-
-# -----------------------------------------------------------------------------
-# Helper Functions
-# -----------------------------------------------------------------------------
-
-def get_latest_checkpoint(out_dir):
-    """Finds the latest checkpoint file in out_dir."""
-    if not os.path.exists(out_dir):
-        return None
-    
-    # Check for specific files
-    ckpt_path = os.path.join(out_dir, 'ckpt.pt')
-    if os.path.exists(ckpt_path):
-        return ckpt_path
-
-    # Check for versioned files ckpt_{iter}.pt
-    files = [f for f in os.listdir(out_dir) if f.startswith('ckpt_') and f.endswith('.pt')]
-    if not files:
-        return None
-    
-    # Extract version numbers
-    def extract_iter(f):
-        try:
-            return int(f.split('_')[1].split('.')[0])
-        except (IndexError, ValueError):
-            return -1
-            
-    files = sorted(files, key=extract_iter, reverse=True)
-    if files:
-        return os.path.join(out_dir, files[0])
-    
-    return None
-
-class GPT2Dataset(torch.utils.data.Dataset):
-    def __init__(self, data, block_size):
-        self.data = data
-        self.block_size = block_size
-        
-    def __len__(self):
-        return len(self.data) - self.block_size
-        
-    def __getitem__(self, idx):
-        # We need to ensure we don't go out of bounds, though __len__ helps.
-        # Ideally we'd just pick random indices like before for infinite stream, 
-        # but Dataset usually maps index -> item.
-        # To strictly replicate the previous "infinite random sampling" behavior without epochs:
-        # We can make the dataset "infinite" or just very large, OR we can stick to the 
-        # random sampling logic inside __getitem__ if we ignore idx, but that defeats the purpose of map-style.
-        # Better approach for map-style:
-        # Just return the slice at idx. The DataLoader with shuffle=True will handle randomness.
-        # Note: Previous code did random sampling from *anywhere*. 
-        # Configuring an IterableDataset is arguably better for "infinite" streaming, 
-        # but Map-style with Shuffle is standard and easiest to implement for now.
-        
-        # However, for 'infinite' training loop style we used before, a standard epoch-based loader 
-        # might require changing the loop structure (while loader: ...).
-        # Let's keep the existing loop structure and make the loader infinite-cyclic or just re-create it.
-        # Actually, standard practice for LLM pretraining is often IterableDataset.
-        # But let's stick to simple Map-style with a large length or just wrapping it.
-        
-        # IMPORTANT: efficient slicing of memmap is fine.
-        x = torch.from_numpy((self.data[idx:idx+self.block_size]).astype(np.int64))
-        y = torch.from_numpy((self.data[idx+1:idx+1+self.block_size]).astype(np.int64))
-        return x, y
-
-@torch.no_grad()
-def estimate_loss(model, ctx, train_data, val_data, dataset_config, system_config, device, eval_iters):
-    out = {}
-    model.eval()
-    for split, data in [('train', train_data), ('val', val_data)]:
-        losses = torch.zeros(eval_iters)
-        for k in range(eval_iters):
-            # manual random sampling for estimation
-            ix = torch.randint(len(data) - dataset_config.block_size, (dataset_config.batch_size,))
-            x = torch.stack([torch.from_numpy((data[i:i+dataset_config.block_size]).astype(np.int64)) for i in ix])
-            y = torch.stack([torch.from_numpy((data[i+1:i+1+dataset_config.block_size]).astype(np.int64)) for i in ix])
-            
-            device_type = 'cuda' if 'cuda' in system_config.device else 'cpu'
-            if device_type == 'cuda':
-                x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
-            else:
-                x, y = x.to(device), y.to(device)
-            
-            with ctx:
-                logits, loss = model(x, y)
-            losses[k] = loss.item()
-        out[split] = losses.mean()
-    model.train()
-    return out
-
-def get_lr(it, train_config):
-    # 1) linear warmup for warmup_iters steps
-    if it < train_config.warmup_iters:
-        return train_config.learning_rate * it / train_config.warmup_iters
-    # 2) if it > lr_decay_iters, return min learning rate
-    if it > train_config.lr_decay_iters:
-        return train_config.min_lr
-    # 3) in between, use cosine decay down to min learning rate
-    decay_ratio = (it - train_config.warmup_iters) / (train_config.lr_decay_iters - train_config.warmup_iters)
-    assert 0 <= decay_ratio <= 1
-    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff ranges 0..1
-    return train_config.min_lr + coeff * (train_config.learning_rate - train_config.min_lr)
-
-def parse_args():
-    # default configs
-    system = SystemConfig()
-    dataset = DatasetConfig()
-    train = TrainConfig()
-    model = ModelConfig()
-    
-    # parse args
-    for arg in sys.argv[1:]:
-        if '=' not in arg:
-            # assume it's a config file
-            assert not arg.startswith('--')
-            config_file = arg
-            print(f"Overriding config with {config_file}:")
-            with open(config_file) as f:
-                print(f.read())
-            # This part is tricky with dataclasses because exec would need to update the objects
-            # For simplicity in this refactor, we'll skip arbitrary python file execution for now
-            # and focus on CLI args, OR we can implement a simple parser for the file.
-            # let's skip file exec for safety and clarity in this version or use a dict approach if needed.
-            print("WARNING: Config file loading via exec() is disabled in this refactor. Use CLI arguments.")
-        else:
-            # assume it's a --key=value argument
-            assert arg.startswith('--')
-            key, val = arg.split('=')
-            key = key[2:]
-            
-            try:
-                attempt = literal_eval(val)
-            except (ValueError, SyntaxError):
-                attempt = val
-                
-            # try to find which config object owns this key
-            found = False
-            for conf in [system, dataset, train, model]:
-                if hasattr(conf, key):
-                    setattr(conf, key, attempt)
-                    print(f"Overriding: {key} = {attempt}")
-                    found = True
-                    break
-            if not found:
-                 raise ValueError(f"Unknown config key: {key}")
-                 
-    return system, dataset, train, model
+import config
+import utils
+import data_loader
 
 # -----------------------------------------------------------------------------
 # Main Training Function
 # -----------------------------------------------------------------------------
 
 def main():
-    system_cfg, dataset_cfg, train_cfg, model_cfg = parse_args()
+    system_cfg, dataset_cfg, train_cfg, model_cfg = config.parse_args()
 
     # DDP setup
     ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
@@ -274,7 +70,7 @@ def main():
     train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
     val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
 
-    train_dataset = GPT2Dataset(train_data, dataset_cfg.block_size)
+    train_dataset = data_loader.GPT2Dataset(train_data, dataset_cfg.block_size)
     train_loader = torch.utils.data.DataLoader(
         train_dataset, 
         batch_size=dataset_cfg.batch_size, 
@@ -296,7 +92,7 @@ def main():
         model = GPT2(model_cfg)
     elif dataset_cfg.init_from == 'resume':
         print(f"Resuming training from {system_cfg.out_dir}")
-        ckpt_path = get_latest_checkpoint(system_cfg.out_dir)
+        ckpt_path = utils.get_latest_checkpoint(system_cfg.out_dir)
         if ckpt_path is None:
             print(f"No checkpoint found in {system_cfg.out_dir}, starting from scratch")
             dataset_cfg.init_from = 'scratch'
@@ -355,8 +151,6 @@ def main():
         model = torch.compile(model)
         
         # Warmup compilation with a dummy step
-        # This forces the compilation to happen NOW, before we load the optimizer state
-        # preventing the memory spike of (Model + Optimizer + Compile Overhead)
         print("running warmup step for compilation...")
         dummy_x = torch.randint(0, 50257, (dataset_cfg.batch_size, dataset_cfg.block_size), device=device)
         dummy_y = torch.randint(0, 50257, (dataset_cfg.batch_size, dataset_cfg.block_size), device=device)
@@ -383,13 +177,13 @@ def main():
     
     while True:
         # Learning rate
-        lr = get_lr(iter_num, train_cfg) if train_cfg.decay_lr else train_cfg.learning_rate
+        lr = utils.get_lr(iter_num, train_cfg) if train_cfg.decay_lr else train_cfg.learning_rate
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
         
         # Evaluate
         if iter_num % dataset_cfg.eval_interval == 0 and master_process:
-            losses = estimate_loss(model, ctx, train_data, val_data, dataset_cfg, system_config=system_cfg, device=device, eval_iters=dataset_cfg.eval_iters)
+            losses = utils.estimate_loss(model, ctx, train_data, val_data, dataset_config=dataset_cfg, system_config=system_cfg, device=device, eval_iters=dataset_cfg.eval_iters)
             print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
             if master_process:
                 writer.add_scalar("loss/train", losses['train'], iter_num)
