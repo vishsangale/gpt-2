@@ -59,6 +59,17 @@ The modernized model was *too good* for the data. The SwiGLU layers and improved
 
 It learned faster (training loss plummeted), but it failed to generalize better (validation loss spiked). This was a textbook case of **overfitting due to over-parameterization relative to data size**.
 
+### Qualitative Check: The Memorization
+When prompted with *"The king hath"*, the differences were telling:
+
+**Vanilla:**
+> "The king hath given again; Supposing it in grace my mind..."
+*(Grammatically okay, but semantically drifting.)*
+
+**Modernized:**
+> "The king hath our common consul... And leave Corioli, let me say..."
+*(This is suspicious. It's almost reciting lines. The model is overfitting/memorizing rather than generating.)*
+
 ---
 
 ## 4. Experiment 2: The Ablation Study (Who contributed what?)
@@ -85,6 +96,17 @@ To prove the architecture works, we needed a dataset that could withstand the po
 | **Val Loss (Step 2000)** | 4.4223 | **4.0407** |
 
 On the larger dataset, the overfitting vanished. The modernized model leveraged its superior architecture to learn more generalized patterns, achieving an **8.6% improvement** in validation loss over the baseline.
+
+### Seeing is Believing
+We generated samples from the FineWeb models starting with *"The internet is"*:
+
+**Vanilla Model:**
+> "The internet is usually done when the user's homeware is allowed for the user to access it... many hackers can switch data..."
+*(Slightly hallucinated terms like "homeware", a bit rambling.)*
+
+**Modernized Model:**
+> "The internet is the key to the growth of a business... A business is not only a business but a financial institution..."
+*(Grammatically perfect, highly coherent, if a bit repetitive. It sounds like a generic business article, which accurately reflects the training data distribution!)*
 
 ---
 
