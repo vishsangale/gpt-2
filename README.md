@@ -10,8 +10,9 @@ This project is a clean, optimized PyTorch implementation of GPT-2, trained on t
 
 ## 🏗️ The Architecture
 
-The core implementation (`model.py`) mirrors the original OpenAI 124M parameter model:
+The core implementation (`model.py`) mirrors the original OpenAI 124M parameter model but with optional modernization features enabled by default:
 - **12 Layers**, **12 Heads**, **768 Embedding Dimension**.
+- **Modern Features**: RoPE (Rotary Positional Embeddings), RMSNorm, and SwiGLU activations are enabled by default in `config.py` for improved performance.
 - **Causal Self-Attention**: The heart of the model, masking future tokens.
 - **Learned Positional Embeddings**: Standard GPT-2 style embedding (up to 1024 context length).
 - **Weight Tying**: The embedding layer weights are shared with the final output projection head (`lm_head`).
@@ -79,10 +80,18 @@ sudo apt install python3-dev nvidia-cuda-toolkit
 ```
 
 ### 1. Prepare Data
-Download and tokenize the dataset:
+Download and tokenize the dataset. You can choose between 'tinyshakespeare' (default) or 'fineweb'.
+
+For TinyShakespeare:
 ```bash
-python3 prepare_data.py
+python3 prepare_data.py --dataset tinyshakespeare
 ```
+
+For FineWeb (10B token sample from FineWeb-Edu):
+```bash
+python3 prepare_data.py --dataset fineweb
+```
+To run fine-web preparation you will need to install `datasets` library: `pip install datasets`
 
 ### 2. Train
 Run the fully optimized training script:
