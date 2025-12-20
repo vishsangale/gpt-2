@@ -55,9 +55,9 @@ class ModelConfig:
     block_size: int = 1024
     gradient_checkpointing: bool = True # Trade compute to save memory
     # Modernization flags
-    use_rmsnorm: bool = False
-    use_rope: bool = False
-    use_swiglu: bool = False
+    use_rmsnorm: bool = True
+    use_rope: bool = True
+    use_swiglu: bool = True
 
 def parse_args():
     # default configs
