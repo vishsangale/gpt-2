@@ -37,25 +37,31 @@ def precompute_freqs_cis(dim, end, theta=10000.0):
     t = torch.arange(end, device=freqs.device)
     freqs = torch.outer(t, freqs).float()
     freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
-    return freqs_cis
+    return freqs_cis.detach()
 
 def apply_rotary_emb(xq, xk, freqs_cis):
+    # Ensure Q/K and freqs_cis are compatible dtypes for complex multiplication
+    # We generally want to perform rotation in float32 for precision, then cast back
+    
+    # Reshape Q/K to expose rotation pairs
     xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
     xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
-    freqs_cis = freqs_cis[:xq_.shape[2]] # match sequence length
-    # broadcast to batch and num_heads
-    # xq matches (B, T, n_head, head_dim/2 complex) or (B, n_head, T, ...)
-    # Our Q is (B, n_head, T, head_dim)
-    # let's assume we reshape to (B, n_head, T, head_dim/2, 2) -> complex
     
-    # Actually, current implementation of CausalSelfAttention transposes to (B, nh, T, hs)
-    # We apply rope on the 'T' dimension.
+    # Match sequence length
+    freqs_cis = freqs_cis[:xq_.shape[2]] 
+    
+    # Ensure freqs_cis is on the same device as xq_
+    freqs_cis = freqs_cis.to(xq_.device)
+
+    # Broadcast to batch and num_heads (1, 1, T, hs/2)
     # Dimensions: xq_: (B, nh, T, hs/2)
-    # freqs_cis: (T, hs/2) -> broadcast to (1, 1, T, hs/2)
     freqs_cis = freqs_cis.view(1, 1, freqs_cis.shape[0], freqs_cis.shape[1])
     
+    # Apply rotation
     xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
     xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
+    
+    # Cast back to original dtype
     return xq_out.type_as(xq), xk_out.type_as(xk)
 
 # -----------------------------------------------------------------------------
@@ -65,19 +71,15 @@ class CausalSelfAttention(nn.Module):
         super().__init__()
         assert config.n_embd % config.n_head == 0
         # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
         # output projection
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
         # regularization
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
-        # valid_length check (flash attention) could be added here if needed
-        self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
-                                     .view(1, 1, config.block_size, config.block_size))
-
 
     
     def forward(self, x, freqs_cis=None):
@@ -106,8 +108,8 @@ class MLP(nn.Module):
         if getattr(config, 'use_swiglu', False):
             self.swiglu = SwiGLU(config)
         else:
-            self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd)
-            self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd)
+            self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
+            self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
             self.dropout = nn.Dropout(config.dropout)
             self.gelu = nn.GELU()
 
@@ -159,7 +161,7 @@ class GPT2(nn.Module):
             
             # Precompute freqs_cis
             head_dim = config.n_embd // config.n_head
-            self.freqs_cis = precompute_freqs_cis(head_dim, config.block_size * 2) # *2 just in case
+            self.register_buffer('freqs_cis', precompute_freqs_cis(head_dim, config.block_size * 2))
         else:
             self.transformer = nn.ModuleDict(dict(
                 wte = nn.Embedding(config.vocab_size, config.n_embd),
@@ -169,7 +171,7 @@ class GPT2(nn.Module):
                 ln_f = RMSNorm(config.n_embd) if getattr(config, 'use_rmsnorm', False) else nn.LayerNorm(config.n_embd),
             ))
 
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=config.bias)
 
         # with weight tying when using torch.compile() some warnings get generated:
         # "UserWarning: functional_call was passed a dict that contains keys that are not in the module..."
@@ -202,7 +204,9 @@ class GPT2(nn.Module):
         if getattr(self.config, 'use_rope', False):
             # No wpe
             x = self.transformer.drop(tok_emb)
-            freqs_cis = self.freqs_cis[:t].to(device)
+            # freqs_cis is registered as a buffer, so it is already on the correct device.
+            # We just need to slice it to the current sequence length.
+            freqs_cis = self.freqs_cis[:t]
         else:
             pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
             pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
@@ -243,6 +247,7 @@ class GPT2(nn.Module):
         self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
         for block in self.transformer.h:
             if hasattr(block.attn, 'bias'):
+                # In case we re-add bias buffer later; currently unused
                 block.attn.bias = block.attn.bias[:,:,:block_size,:block_size]
     
     @classmethod

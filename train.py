@@ -193,7 +193,7 @@ def main():
             if losses['val'] < best_val_loss:
                 best_val_loss = losses['val']
         
-        if iter_num > 0 and iter_num % dataset_cfg.checkpoint_interval == 0 and master_process:
+        if iter_num > 0 and iter_num % dataset_cfg.checkpoint_interval == 0 and master_process and dataset_cfg.always_save_checkpoint:
             checkpoint = {
                 'model': raw_model.state_dict(),
                 'optimizer': optimizer.state_dict(),
