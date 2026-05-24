@@ -88,7 +88,7 @@ def main():
     
     if dataset_cfg.init_from == 'scratch':
         print("Initializing a new model from scratch")
-        model_cfg.vocab_size = 50257
+        # model_cfg.vocab_size = 50257 # use the optimized 50304 from config.py instead
         model = GPT2(model_cfg)
     elif dataset_cfg.init_from == 'resume':
         print(f"Resuming training from {system_cfg.out_dir}")
